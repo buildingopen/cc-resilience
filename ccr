@@ -322,7 +322,9 @@ def cmd_loop(args):
         write_state(state, body)
 
         # Call Claude with timeout
-        cmd = [claude_bin, "-p", prompt, "--output-format", "json"]
+        cmd = [claude_bin, "-p", prompt, "--output-format", "json",
+               "--allowedTools", "Bash", "Edit", "Write", "Read", "Glob", "Grep",
+               "WebFetch", "WebSearch"]
         if session_id: cmd += ["--resume", session_id]
 
         result, stderr_out = None, b""
