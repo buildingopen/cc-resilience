@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""ccr — CC-Resilience unified CLI."""
+import json, os, re, subprocess, sys, hashlib
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE_PATH = ".claude/target-loop.local.md"
+TARGETS_PATH = ".claude/targets.local.yaml"
+
+# ─── Core helpers ─────────────────────────────────────────────────
+
+def read_state(path=STATE_PATH):
+    if not os.path.exists(path): return None, ""
+    text = Path(path).read_text()
+    m = re.match(r'^---\n(.*?)\n---\n?(.*)', text, re.DOTALL)
+    if not m: return {}, text
+    state = {}
+    for line in m.group(1).splitlines():
+        if ':' in line:
+            k, v = line.split(':', 1); v = v.strip().strip('"')
+            if v == 'true': v = True
+            elif v == 'false': v = False
+            elif v.isdigit(): v = int(v)
+            state[k.strip()] = v
+    return state, m.group(2).strip()
+
+def write_state(state, body="", path=STATE_PATH):
+    lines = ["---"]
+    for k, v in state.items():
+        if isinstance(v, bool): lines.append(f"{k}: {'true' if v else 'false'}")
+        elif isinstance(v, str) and (not v or any(c in v for c in ' :"')): lines.append(f'{k}: "{v}"')
+        else: lines.append(f"{k}: {v}")
+    lines += ["---", "", body, ""] if body else ["---", ""]
+    Path(path).write_text("\n".join(lines))
+
+def parse_targets(path=TARGETS_PATH):
+    if not os.path.exists(path): return None
+    import yaml
+    data = yaml.safe_load(Path(path).read_text())
+    if isinstance(data, list): return data
+    return data.get("targets", data.get("target", [])) if isinstance(data, dict) else []
+
+def run_verifications(targets, timeout=30):
+    results, statuses, passed = [], {}, 0
+    for t in targets:
+        tid, name = t.get("id", f"T{len(results)}"), t.get("name", "")
+        verify, depends = t.get("verify", "true"), t.get("depends", [])
+        if any(statuses.get(d) != "PASS" for d in depends if d in statuses):
+            statuses[tid] = "BLOCKED"
+            results.append({"id": tid, "name": name, "status": "BLOCKED", "exit_code": None, "output": f"Blocked: {depends}"})
+            continue
+        try:
+            r = subprocess.run(["bash", "-c", verify], capture_output=True, text=True, timeout=timeout)
+            out = "\n".join((r.stdout + r.stderr).strip().splitlines()[-30:])
+            ec = r.returncode
+        except subprocess.TimeoutExpired: out, ec = f"TIMEOUT ({timeout}s)", 124
+        except Exception as e: out, ec = str(e), 1
+        status = "PASS" if ec == 0 else "FAIL"
+        statuses[tid] = status
+        if ec == 0: passed += 1
+        results.append({"id": tid, "name": name, "status": status, "exit_code": ec, "output": out[:2000]})
+    total = len(results)
+    ff = next((r for r in results if r["status"] in ("FAIL", "BLOCKED")), None)
+    return {"all_pass": passed == total > 0, "passed": passed, "total": total,
+            "first_fail": ff["id"] if ff else None, "first_fail_output": ff["output"][:500] if ff else None, "results": results}
+
+def generate_prompt(vr, state):
+    it, mx = state.get("iteration", 1), state.get("max_iterations", 20)
+    consec, last_hash = state.get("consecutive_same_failures", 0), state.get("last_failure_hash", "")
+    ff, ffo = vr.get("first_fail", ""), vr.get("first_fail_output", "")
+    cur_hash = hashlib.md5(f"{ff}:{ffo}".encode()).hexdigest()
+    consec = consec + 1 if cur_hash == last_hash else 0
+    # Target status
+    sl = []
+    for r in vr["results"]:
+        icon = {"PASS": "✅", "FAIL": "❌", "BLOCKED": "⬜"}.get(r["status"], "🔲")
+        sl.append(f"{icon} {r['id']}: {r['name']} — {r['status']}" + (f" (exit {r['exit_code']})" if r["status"] == "FAIL" else ""))
+        if r["status"] == "FAIL" and r.get("output"):
+            sl += ["   ```"] + [f"   {l}" for l in r["output"].splitlines()[:20]] + ["   ```"]
+    stuck = ""
+    if consec >= 5: stuck = f"\n⚠️  STUCK LOOP: {ff} failed {consec}x same error. Try a FUNDAMENTALLY DIFFERENT APPROACH.\n"
+    elif consec >= 3: stuck = f"\n⚠️  {ff} failed {consec}x same error. Try a different approach.\n"
+    prompt = f"""═══════════════════════════════════════════════════════
+ITERATION {it}/{mx} — {vr['passed']}/{vr['total']} targets passing
+═══════════════════════════════════════════════════════
+
+## Target Status (automated — NOT self-assessed)
+
+{chr(10).join(sl)}
+
+{"## Focus: " + ff + chr(10) + "```" + chr(10) + chr(10).join(ffo.splitlines()[:20]) + chr(10) + "```" + chr(10) if ff and ffo else ("## Focus: " + ff + chr(10) if ff else "")}
+{stuck}## Rules (enforced)
+- Fix FIRST failing target before others
+- Do NOT modify .claude/targets.local.yaml or test files
+- Do NOT suggest stopping — loop controller decides
+- {mx - it} iterations remaining
+═══════════════════════════════════════════════════════"""
+    return {"prompt": prompt, "consecutive_same_failures": consec, "last_failure_hash": cur_hash}
+
+def git_diff_names():
+    try:
+        r = subprocess.run(["git", "diff", "--name-only"], capture_output=True, text=True, timeout=5)
+        return r.stdout.strip().splitlines() if r.returncode == 0 else []
+    except: return []
+
+def check_tamper():
+    return [f for f in git_diff_names() if "target-loop.local.md" in f or "targets.local.yaml" in f]
+
+def check_test_tamper():
+    p = re.compile(r'\.(test|spec)\.(ts|tsx|js|jsx)$|test_.*\.py$|.*_test\.(py|go|rs)$|test_.*\.go$')
+    return [f for f in git_diff_names() if p.search(f)]
+
+def revert(files):
+    for f in files: subprocess.run(["git", "checkout", "--", f], capture_output=True, timeout=5)
+
+def decision(reason, msg): json.dump({"decision": "block", "reason": reason, "systemMessage": msg}, sys.stdout)
+
+# ─── Error classification ─────────────────────────────────────────
+
+PATTERNS = [
+    ("POISON", [r"image dimensions exceed max allowed size", r"image exceeds 5 MB maximum", r"Conversation too long.*try again"]),
+    ("CONTEXT", [r"input length and max_tokens exceed context limit", r"Context limit reached"]),
+    ("TRANSIENT", [r"529.*overloaded", r"ECONNRESET", r"ETIMEDOUT", r"socket hang up", r"500 Internal server error", r"EPIPE", r"broken pipe", r"SIGKILL", r"signal 9"]),
+    ("AUTH", [r"authentication_error", r"HTTP.?401", r"status.*401", r"Unauthorized", r"HTTP.?403", r"status.*403", r"Forbidden"]),
+]
+
+def classify_error(text):
+    for cls, pats in PATTERNS:
+        if any(re.search(p, text, re.I) for p in pats): return cls
+    return "UNKNOWN"
+
+def extract_progress(path, n=5):
+    if not os.path.exists(path): return ""
+    try:
+        entries = [json.loads(l) for l in Path(path).read_text().strip().splitlines() if l.strip()]
+        texts = []
+        for m in [e for e in entries if e.get("type") == "assistant"][-n:]:
+            texts += [b["text"][:500] for b in m.get("message", {}).get("content", []) if b.get("type") == "text"]
+        return "\n---\n".join(texts)
+    except: return ""
+
+# ─── Subcommands ──────────────────────────────────────────────────
+
+def cmd_verify(args):
+    targets = parse_targets()
+    if not targets: json.dump({"error": "No targets"}, sys.stdout); sys.exit(1)
+    result = run_verifications(targets)
+    json.dump(result, sys.stdout, indent=2); print()
+    if "--status-only" in args:
+        print(f"\nTarget Status: {result['passed']}/{result['total']} passing")
+        for r in result["results"]:
+            icon = {"PASS": "✅", "FAIL": "❌", "BLOCKED": "⬜"}.get(r["status"], "🔲")
+            print(f"  {icon} {r['id']}: {r['name']} — {r['status']}")
+            if r["status"] == "FAIL" and r.get("output"):
+                for l in r["output"].splitlines()[:5]: print(f"     {l}")
+
+def cmd_prompt(args):
+    state, _ = read_state()
+    if not state: print("ERROR: No state file", file=sys.stderr); sys.exit(1)
+    vr = json.load(sys.stdin) if not sys.stdin.isatty() else run_verifications(parse_targets() or sys.exit(1))
+    r = generate_prompt(vr, state)
+    print(r["prompt"])
+    print(f"CONSEC_FAILS={r['consecutive_same_failures']}", file=sys.stderr)
+    print(f"LAST_HASH={r['last_failure_hash']}", file=sys.stderr)
+
+def cmd_stop_hook(args):
+    state, body = read_state()
+    if state is None: sys.exit(0)
+    it, mx = state.get("iteration", 1), state.get("max_iterations", 20)
+    phase, approved = state.get("phase", "outline"), state.get("targets_approved", False)
+
+    tampered = check_tamper()
+    if tampered:
+        revert([STATE_PATH, TARGETS_PATH])
+        decision(f"TAMPERING DETECTED on {' '.join(tampered)}. REVERTED. Fix implementation, not control files.", "🚫 Tamper reverted")
+        return
+    if not isinstance(it, int) or not isinstance(mx, int):
+        os.remove(STATE_PATH); sys.exit(0)
+    if mx > 0 and it >= mx:
+        print(f"🛑 Max iterations ({mx}) reached."); os.remove(STATE_PATH); sys.exit(0)
+
+    if phase == "outline" and not approved:
+        if os.path.exists(TARGETS_PATH):
+            state["phase"] = "approval"; write_state(state, body)
+            decision("Targets created. Ask user to review .claude/targets.local.yaml. Once approved, set targets_approved: true and phase: build.", "🎯 Awaiting approval")
+        else:
+            decision("Create .claude/targets.local.yaml first.", "🎯 OUTLINE — create targets")
+        return
+    if phase == "approval" and not approved:
+        decision("Targets need user approval. Ask: 'Review .claude/targets.local.yaml, type approve to start.'", "🎯 Awaiting approval")
+        return
+
+    if not os.path.exists(TARGETS_PATH): os.remove(STATE_PATH); sys.exit(0)
+    targets = parse_targets()
+    if not targets: os.remove(STATE_PATH); sys.exit(0)
+    vr = run_verifications(targets)
+    if vr["all_pass"]:
+        print(f"🎯 ALL {vr['passed']} targets passed!"); os.remove(STATE_PATH); sys.exit(0)
+
+    pr = generate_prompt(vr, state)
+    prompt = pr["prompt"]
+    tt = check_test_tamper()
+    if tt:
+        revert(tt)
+        prompt += f"\n\n⚠️ TEST TAMPERING: {', '.join(tt)} REVERTED. Fix implementation, not tests."
+
+    ni = it + 1
+    state.update(iteration=ni, consecutive_same_failures=pr["consecutive_same_failures"], last_failure_hash=pr["last_failure_hash"])
+    write_state(state, body)
+    decision(prompt, f"🎯 Iter {ni}/{mx} | {vr['passed']}/{vr['total']} | Focus: {vr.get('first_fail','?')} | {mx-ni} left")
+
+def cmd_setup(args):
+    parts, mx, tf = [], 20, ""
+    i = 0
+    while i < len(args):
+        if args[i] == "--max-iterations" and i+1 < len(args): mx = int(args[i+1]); i += 2
+        elif args[i] == "--targets-file" and i+1 < len(args):
+            tf = args[i+1]
+            if not os.path.exists(tf): print(f"❌ Not found: {tf}", file=sys.stderr); sys.exit(1)
+            i += 2
+        elif args[i] in ("-h", "--help"): print("Usage: ccr setup PROMPT [--max-iterations N] [--targets-file PATH]"); sys.exit(0)
+        else: parts.append(args[i]); i += 1
+    prompt = " ".join(parts)
+    if not prompt: print("❌ No prompt.", file=sys.stderr); sys.exit(1)
+    if os.path.exists(STATE_PATH): print("⚠️  Loop already active.", file=sys.stderr); sys.exit(1)
+    os.makedirs(".claude", exist_ok=True)
+    if tf: __import__("shutil").copy2(tf, TARGETS_PATH); print(f"📋 Loaded: {tf}")
+    write_state({"active": True, "iteration": 1, "max_iterations": mx, "phase": "outline",
+                  "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "targets_approved": False, "consecutive_same_failures": 0, "last_failure_hash": ""}, prompt)
+    print(f"🎯 Target Loop activated! max={mx} phase=OUTLINE\n{prompt}")
+
+def cmd_classify(_): print(classify_error(sys.stdin.read()))
+
+def cmd_progress(args):
+    path, n, i = None, 5, 0
+    while i < len(args):
+        if args[i] in ("--jsonl", "-n") and i+1 < len(args):
+            if args[i] == "-n": n = int(args[i+1])
+            else: path = args[i+1]
+            i += 2
+        else: path = args[i]; i += 1
+    if not path: print("Usage: ccr progress PATH", file=sys.stderr); sys.exit(1)
+    print(extract_progress(path, n))
+
+def cmd_parse_field(args):
+    if not args: sys.exit(1)
+    print(json.load(sys.stdin).get(args[0], ""))
+
+def cmd_state(args):
+    """Output a state field value. Usage: ccr state FIELD"""
+    if not args: print("Usage: ccr state FIELD [--body]", file=sys.stderr); sys.exit(1)
+    state, body = read_state()
+    if state is None: sys.exit(1)
+    if args[0] == "--body": print(body)
+    else: print(state.get(args[0], ""))
+
+
+def cmd_update_state(args):
+    """Update state fields. Usage: ccr update-state key=value [key=value ...]"""
+    state, body = read_state()
+    if state is None: print("No state file", file=sys.stderr); sys.exit(1)
+    for arg in args:
+        if "=" not in arg: continue
+        k, v = arg.split("=", 1)
+        if v == "true": v = True
+        elif v == "false": v = False
+        elif v.isdigit(): v = int(v)
+        state[k] = v
+    write_state(state, body)
+
+# ─── Main ─────────────────────────────────────────────────────────
+
+COMMANDS = {"verify": cmd_verify, "prompt": cmd_prompt, "stop-hook": cmd_stop_hook,
+            "setup": cmd_setup, "classify": cmd_classify, "progress": cmd_progress,
+            "parse-field": cmd_parse_field, "state": cmd_state, "update-state": cmd_update_state}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(f"Usage: ccr <{'|'.join(COMMANDS)}> [args]"); sys.exit(0)
+    cmd = sys.argv[1]
+    if cmd not in COMMANDS: print(f"Unknown: {cmd}", file=sys.stderr); sys.exit(1)
+    COMMANDS[cmd](sys.argv[2:])
