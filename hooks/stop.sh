@@ -16,5 +16,5 @@ if [[ -n "$OUTPUT" ]]; then
     echo "$OUTPUT"
 else
     # No output = no active loop or clean exit
-    echo '{"decision":"allow"}'
+    echo '{"decision":"approve"}'
 fi
