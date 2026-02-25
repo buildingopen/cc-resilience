@@ -58,7 +58,7 @@ assert "UNKNOWN: random text" "UNKNOWN" "$(echo 'something weird happened' | "$C
 echo "═══ setup ═══"
 OUT=$("$CCR" setup "Build a test project" --max-iterations 8 2>&1)
 assert_contains "setup creates state file" "Target Loop activated" "$OUT"
-assert "state: iteration=1" "1" "$("$CCR" state iteration)"
+assert "state: iteration=0" "0" "$("$CCR" state iteration)"
 assert "state: max_iterations=8" "8" "$("$CCR" state max_iterations)"
 assert "state: phase=outline" "outline" "$("$CCR" state phase)"
 assert "state: body preserved" "Build a test project" "$("$CCR" state --body)"

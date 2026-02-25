@@ -225,7 +225,7 @@ def cmd_setup(args):
     if os.path.exists(STATE_PATH): print("⚠️  Loop already active.", file=sys.stderr); sys.exit(1)
     os.makedirs(".claude", exist_ok=True)
     if tf: __import__("shutil").copy2(tf, TARGETS_PATH); print(f"📋 Loaded: {tf}")
-    write_state({"active": True, "iteration": 1, "max_iterations": mx, "phase": "outline",
+    write_state({"active": True, "iteration": 0, "max_iterations": mx, "phase": "outline",
                   "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                   "targets_approved": False, "consecutive_same_failures": 0, "last_failure_hash": ""}, prompt)
     print(f"🎯 Target Loop activated! max={mx} phase=OUTLINE\n{prompt}")
@@ -269,11 +269,133 @@ def cmd_update_state(args):
         state[k] = v
     write_state(state, body)
 
+def cmd_loop(args):
+    """Headless iteration loop. Exit: 0=pass, 1=max-iter, 2=config, 3=prompt-fail."""
+    import signal, time, shutil
+
+    claude_timeout = int(os.environ.get("CLAUDE_TIMEOUT", "600"))
+    verify_timeout = int(os.environ.get("VERIFY_TIMEOUT", "120"))
+    max_empty = 3
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        print("ERROR: claude not found in PATH", file=sys.stderr); sys.exit(2)
+
+    state, body = read_state()
+    if state is None:
+        print("ERROR: No state file", file=sys.stderr); sys.exit(2)
+    if not os.path.exists(TARGETS_PATH):
+        print("ERROR: No targets file", file=sys.stderr); sys.exit(2)
+    targets = parse_targets()
+    if not targets:
+        print("ERROR: No targets defined", file=sys.stderr); sys.exit(2)
+
+    max_iter = state.get("max_iterations", 20)
+    iteration = state.get("iteration", 0)
+    session_id = str(state.get("session_id", "") or "")
+    prompt = body
+    if not isinstance(max_iter, int) or max_iter < 1:
+        print(f"ERROR: max_iterations invalid: {max_iter}", file=sys.stderr); sys.exit(2)
+    if not isinstance(iteration, int): iteration = 0
+    if not prompt:
+        print("ERROR: Empty initial prompt", file=sys.stderr); sys.exit(2)
+
+    # Kill Claude subprocess on signal
+    proc = None
+    def on_signal(sig, _):
+        nonlocal proc
+        if proc and proc.poll() is None: proc.kill(); proc.wait()
+        sys.exit(128 + sig)
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    if session_id: print(f"Resuming session: {session_id} from iteration {iteration}")
+    print(f"═══ TARGET LOOP: max={max_iter} iter={iteration} ═══")
+
+    empty_count = 0
+    while True:
+        iteration += 1
+        if iteration > max_iter:
+            print(f"═══ MAX ITERATIONS ({max_iter}) ═══"); sys.exit(1)
+        print(f"\n═══ ITERATION {iteration}/{max_iter} ═══")
+
+        state["iteration"] = iteration
+        write_state(state, body)
+
+        # Call Claude with timeout
+        cmd = [claude_bin, "-p", prompt, "--output-format", "json"]
+        if session_id: cmd += ["--resume", session_id]
+
+        result, stderr_out = None, b""
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout_out, stderr_out = proc.communicate(timeout=claude_timeout)
+            text = stdout_out.decode("utf-8", errors="replace").strip()
+            if text:
+                try: result = json.loads(text)
+                except json.JSONDecodeError:
+                    m = re.search(r'\{.*\}', text, re.DOTALL)
+                    if m:
+                        try: result = json.loads(m.group())
+                        except: pass
+        except subprocess.TimeoutExpired:
+            print(f"WARNING: Claude timed out after {claude_timeout}s, killing...")
+            proc.kill(); proc.wait()
+        except Exception as e:
+            print(f"WARNING: Claude failed: {e}")
+        finally:
+            proc = None
+
+        if result is None:
+            empty_count += 1
+            if empty_count >= max_empty:
+                print(f"FATAL: {max_empty} consecutive empty outputs")
+                if stderr_out: print(stderr_out.decode("utf-8", errors="replace")[:2000])
+                sys.exit(1)
+            print(f"WARNING: Empty output ({empty_count}/{max_empty}), backing off 10s...")
+            time.sleep(10)
+            continue
+        empty_count = 0
+
+        sid = result.get("session_id", "")
+        if sid:
+            session_id = str(sid)
+            state["session_id"] = session_id
+            write_state(state, body)
+        print(f"Claude done (session={session_id}). Verifying...")
+
+        vr = run_verifications(targets, timeout=verify_timeout)
+        print(f"Targets: {vr['passed']}/{vr['total']} all_pass={vr['all_pass']}")
+
+        if vr["all_pass"]:
+            print(f"\n═══ ALL PASSED after {iteration} iters ═══")
+            state["phase"] = "done"; write_state(state, body)
+            sys.exit(0)
+
+        # Restore tampered targets
+        try:
+            r = subprocess.run(["git", "rev-parse", "--git-dir"], capture_output=True, timeout=5)
+            if r.returncode == 0:
+                for da in [["git","diff","--name-only"], ["git","diff","--cached","--name-only"]]:
+                    r = subprocess.run(da + ["--", TARGETS_PATH], capture_output=True, text=True, timeout=5)
+                    if r.returncode == 0 and TARGETS_PATH in r.stdout:
+                        subprocess.run(["git","checkout","--", TARGETS_PATH], capture_output=True, timeout=5)
+                        targets = parse_targets() or targets
+        except: pass
+
+        pr = generate_prompt(vr, state)
+        prompt = pr.get("prompt", "")
+        if not prompt:
+            print("FATAL: Failed to generate next prompt", file=sys.stderr); sys.exit(3)
+        state["consecutive_same_failures"] = pr["consecutive_same_failures"]
+        state["last_failure_hash"] = pr["last_failure_hash"]
+        write_state(state, body)
+
 # ─── Main ─────────────────────────────────────────────────────────
 
 COMMANDS = {"verify": cmd_verify, "prompt": cmd_prompt, "stop-hook": cmd_stop_hook,
             "setup": cmd_setup, "classify": cmd_classify, "progress": cmd_progress,
-            "parse-field": cmd_parse_field, "state": cmd_state, "update-state": cmd_update_state}
+            "parse-field": cmd_parse_field, "state": cmd_state, "update-state": cmd_update_state,
+            "loop": cmd_loop}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
