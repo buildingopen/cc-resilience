@@ -339,6 +339,9 @@ assert "recover: classify POISON" "POISON" "$(cat "$TMPDIR/cls.out")"
 echo "input length and max_tokens exceed context limit" | "$CCR" classify > "$TMPDIR/cls.out"
 assert "recover: classify CONTEXT" "CONTEXT" "$(cat "$TMPDIR/cls.out")"
 
+echo 'API Error: 500 {"type":"error","error":{"type":"api_error","message":"Internal server error"}}' | "$CCR" classify > "$TMPDIR/cls.out"
+assert "recover: classify api_error" "TRANSIENT" "$(cat "$TMPDIR/cls.out")"
+
 echo "something random" | "$CCR" classify > "$TMPDIR/cls.out"
 assert "recover: classify UNKNOWN" "UNKNOWN" "$(cat "$TMPDIR/cls.out")"
 

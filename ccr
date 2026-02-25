@@ -120,7 +120,7 @@ def decision(reason, msg): json.dump({"decision": "block", "reason": reason, "sy
 PATTERNS = [
     ("POISON", [r"image dimensions exceed max allowed size", r"image exceeds 5 MB maximum", r"Conversation too long.*try again"]),
     ("CONTEXT", [r"input length and max_tokens exceed context limit", r"Context limit reached"]),
-    ("TRANSIENT", [r"529.*overloaded", r"ECONNRESET", r"ETIMEDOUT", r"socket hang up", r"500 Internal server error", r"EPIPE", r"broken pipe", r"SIGKILL", r"signal 9"]),
+    ("TRANSIENT", [r"529.*overloaded", r"ECONNRESET", r"ETIMEDOUT", r"socket hang up", r"500 Internal server error", r"api_error", r"Internal server error", r"EPIPE", r"broken pipe", r"SIGKILL", r"signal 9"]),
     ("AUTH", [r"authentication_error", r"HTTP.?401", r"status.*401", r"Unauthorized", r"HTTP.?403", r"status.*403", r"Forbidden"]),
 ]
 
