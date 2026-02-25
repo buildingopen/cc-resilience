@@ -390,12 +390,148 @@ def cmd_loop(args):
         state["last_failure_hash"] = pr["last_failure_hash"]
         write_state(state, body)
 
+def cmd_recover(args):
+    """Crash-resilient Claude wrapper. Exit: 0=success, 1=exhausted, 2=config."""
+    import signal, time, shutil, glob as globmod
+
+    # Parse args
+    project_dir, goal, session_id = os.getcwd(), "", ""
+    max_retries, verbose = 5, False
+    claude_args = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-d", "--dir") and i+1 < len(args): project_dir = args[i+1]; i += 2
+        elif a in ("-g", "--goal") and i+1 < len(args): goal = args[i+1]; i += 2
+        elif a in ("-s", "--session") and i+1 < len(args): session_id = args[i+1]; i += 2
+        elif a == "--max-retries" and i+1 < len(args): max_retries = int(args[i+1]); i += 2
+        elif a == "--verbose": verbose = True; i += 1
+        elif a in ("-h", "--help"):
+            print("Usage: ccr recover [-d DIR] [-g GOAL] [-s SESSION] [--max-retries N] [--verbose] [-- CLAUDE_ARGS...]"); sys.exit(0)
+        elif a == "--": claude_args = args[i+1:]; break
+        else: claude_args.append(a); i += 1; continue
+        continue
+
+    project_dir = os.path.realpath(project_dir)
+    if not os.path.isdir(project_dir):
+        print(f"ERROR: Not a directory: {project_dir}", file=sys.stderr); sys.exit(2)
+
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        print("ERROR: claude not found in PATH", file=sys.stderr); sys.exit(2)
+
+    log_path = os.path.expanduser("~/cc-resilience/resilience.log")
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    claude_timeout = int(os.environ.get("CLAUDE_TIMEOUT", "600"))
+
+    def log(level, msg):
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = f"{ts} [{level}] {msg}"
+        with open(log_path, "a") as f: f.write(line + "\n")
+        if verbose: print(line, file=sys.stderr)
+
+    def find_session_jsonl():
+        encoded = project_dir.replace("/", "-")
+        d = os.path.expanduser(f"~/.claude/projects/{encoded}")
+        if not os.path.isdir(d): return None
+        files = sorted(globmod.glob(os.path.join(d, "*.jsonl")), key=os.path.getmtime, reverse=True)
+        return files[0] if files else None
+
+    def run_claude(mode, prompt=""):
+        """Run Claude. Returns (exit_code, error_class, stderr_text)."""
+        cmd = [claude_bin]
+        if mode == "continue": cmd.append("-c")
+        elif mode == "resume": cmd += ["-r", session_id]
+        elif mode == "fresh" and prompt: cmd += ["-p", prompt]
+        cmd += claude_args
+
+        try:
+            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, cwd=project_dir)
+            _, stderr_out = proc.communicate(timeout=claude_timeout)
+            stderr_text = stderr_out.decode("utf-8", errors="replace").strip()
+            ec = proc.returncode
+        except subprocess.TimeoutExpired:
+            proc.kill(); proc.wait()
+            stderr_text, ec = f"TIMEOUT after {claude_timeout}s", 124
+        except Exception as e:
+            stderr_text, ec = str(e), 1
+
+        cls = classify_error(stderr_text) if stderr_text else "UNKNOWN"
+        return ec, cls, stderr_text
+
+    # Signal handling
+    proc_ref = [None]
+    def on_signal(sig, _):
+        log("WARN", f"Signal {sig} received, exiting")
+        sys.exit(128 + sig)
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    log("INFO", f"=== cc-resilient starting === Project: {project_dir} | Retries: {max_retries}")
+
+    attempt, delay, last_class = 0, 5, ""
+    while attempt < max_retries:
+        attempt += 1
+        log("INFO", f"--- Attempt {attempt}/{max_retries} ---")
+
+        if attempt == 1:
+            ec, cls, stderr = run_claude("resume" if session_id else "continue")
+
+        elif last_class == "POISON":
+            log("WARN", "Poisoned context — fresh session with recovery")
+            jsonl = find_session_jsonl()
+            progress = extract_progress(jsonl) if jsonl else ""
+            inject = ""
+            if goal: inject += f"## Goal\n{goal}\n\n"
+            if progress: inject += f"## Context from Previous Session\nThe previous session crashed. Here is what was accomplished:\n{progress}\n\nPlease continue.\n"
+            ec, cls, stderr = run_claude("fresh", inject)
+
+        elif last_class == "CONTEXT":
+            log("WARN", "Context overflow — try continue, then fresh")
+            ec, cls, stderr = run_claude("continue")
+            if cls in ("CONTEXT", "POISON"):
+                jsonl = find_session_jsonl()
+                progress = extract_progress(jsonl) if jsonl else ""
+                inject = ""
+                if goal: inject += f"## Goal\n{goal}\n\n"
+                if progress: inject += f"## Context\n{progress}\n"
+                ec, cls, stderr = run_claude("fresh", inject)
+
+        elif last_class in ("TRANSIENT", "AUTH"):
+            log("INFO", f"{last_class} — retrying after {delay}s")
+            time.sleep(delay)
+            ec, cls, stderr = run_claude("continue")
+
+        else:
+            log("WARN", "Unknown error — trying continue")
+            ec, cls, stderr = run_claude("continue")
+
+        log("INFO", f"Exit: {ec}, Class: {cls}")
+
+        if ec == 0:
+            log("INFO", "Session completed successfully.")
+            sys.exit(0)
+
+        last_class = cls
+        if stderr: log("ERROR", f"Stderr: {stderr[:500]}")
+
+        if cls == "POISON":
+            time.sleep(2)
+        else:
+            log("INFO", f"Waiting {delay}s...")
+            time.sleep(delay)
+            delay = min(delay * 2, 120)
+
+    log("ERROR", f"Max retries ({max_retries}) exhausted.")
+    print(f"cc-resilient: Failed after {max_retries} attempts. Last: {last_class}. See: {log_path}", file=sys.stderr)
+    sys.exit(1)
+
 # ─── Main ─────────────────────────────────────────────────────────
 
 COMMANDS = {"verify": cmd_verify, "prompt": cmd_prompt, "stop-hook": cmd_stop_hook,
             "setup": cmd_setup, "classify": cmd_classify, "progress": cmd_progress,
             "parse-field": cmd_parse_field, "state": cmd_state, "update-state": cmd_update_state,
-            "loop": cmd_loop}
+            "loop": cmd_loop, "recover": cmd_recover}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):

@@ -316,6 +316,32 @@ STATUS=$("$CCR" verify --status-only 2>/dev/null)
 assert_contains "status has count" "1/1 passing" "$STATUS"
 assert_contains "status has icon" "✅" "$STATUS"
 
+# ─── 12. recover ──────────────────────────────────────────────────
+echo "═══ recover ═══"
+# Help
+RHELP=$("$CCR" recover --help 2>&1)
+assert_contains "recover: help" "Usage:" "$RHELP"
+
+# Bad dir
+RBAD=$("$CCR" recover -d /nonexistent 2>&1 || true)
+assert_contains "recover: bad dir" "Not a directory" "$RBAD"
+
+# Classify integration (used internally by recover)
+echo "529 overloaded" | "$CCR" classify > "$TMPDIR/cls.out"
+assert "recover: classify TRANSIENT" "TRANSIENT" "$(cat "$TMPDIR/cls.out")"
+
+echo "authentication_error" | "$CCR" classify > "$TMPDIR/cls.out"
+assert "recover: classify AUTH" "AUTH" "$(cat "$TMPDIR/cls.out")"
+
+echo "image dimensions exceed max allowed size" | "$CCR" classify > "$TMPDIR/cls.out"
+assert "recover: classify POISON" "POISON" "$(cat "$TMPDIR/cls.out")"
+
+echo "input length and max_tokens exceed context limit" | "$CCR" classify > "$TMPDIR/cls.out"
+assert "recover: classify CONTEXT" "CONTEXT" "$(cat "$TMPDIR/cls.out")"
+
+echo "something random" | "$CCR" classify > "$TMPDIR/cls.out"
+assert "recover: classify UNKNOWN" "UNKNOWN" "$(cat "$TMPDIR/cls.out")"
+
 # ─── Results ──────────────────────────────────────────────────────
 echo ""
 echo "═══════════════════════════════════"
